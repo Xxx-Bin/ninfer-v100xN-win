@@ -19,10 +19,15 @@
 #include <unordered_map>
 #include <utility>
 
+#if defined(_WIN32)
+#include <malloc.h>   // _aligned_malloc / _aligned_free, used by the direct-read staging buffer
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace ninfer::artifact {
 namespace {
@@ -191,6 +196,23 @@ struct TransparentStringHash {
     }
 };
 
+// UTF-8 rendering of a path for diagnostics. std::filesystem::path::string() uses the ANSI code
+// page on Windows and throws for names outside it (a Chinese artifact path is a supported input),
+// while u8string() is always UTF-8; the byte string is what stderr/logging consumes.
+std::string display_path(const std::filesystem::path& path) {
+#if defined(_WIN32)
+    const std::u8string utf8 = path.u8string();
+    return std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size());
+#else
+    return path.string();
+#endif
+}
+
+// One read-only view of an artifact, either a file on disk or a byte image already in memory.
+//
+// The file-backed form maps the payload for the header/framing reads and serves the bulk transfer
+// through read_direct() at explicit offsets, so a single Reader is safe for concurrent use: no
+// shared file pointer is involved on either platform.
 class MappedFile {
 public:
     explicit MappedFile(std::shared_ptr<const std::vector<std::byte>> image)
@@ -199,43 +221,27 @@ public:
         data_ = image_->data();
         size_ = image_->size();
     }
-    explicit MappedFile(const std::filesystem::path& path) {
-        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-        if (fd < 0) {
-            throw std::system_error(errno, std::generic_category(), "open " + path.string());
-        }
 
-        struct stat status {};
-
-        if (::fstat(fd, &status) != 0) {
-            const int error = errno;
-            ::close(fd);
-            throw std::system_error(error, std::generic_category(), "fstat " + path.string());
-        }
-        if (status.st_size < 0 ||
-            static_cast<std::uintmax_t>(status.st_size) > std::numeric_limits<std::size_t>::max()) {
-            ::close(fd);
-            throw ArtifactError("artifact size does not fit the process address space");
-        }
-
-        const auto size = static_cast<std::size_t>(status.st_size);
-        void* mapping   = nullptr;
-        if (size != 0) {
-            mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-            if (mapping == MAP_FAILED) {
-                const int error = errno;
-                ::close(fd);
-                throw std::system_error(error, std::generic_category(), "mmap " + path.string());
-            }
-        }
-        fd_   = fd;
-        data_ = static_cast<const std::byte*>(mapping);
-        size_ = size;
-    }
+#if defined(_WIN32)
+    explicit MappedFile(const std::filesystem::path& path) { open_windows(path); }
+#else
+    explicit MappedFile(const std::filesystem::path& path) { open_posix(path); }
+#endif
 
     ~MappedFile() {
-        if (data_ != nullptr && !image_) { ::munmap(const_cast<std::byte*>(data_), size_); }
+        if (data_ != nullptr && !image_) {
+#if defined(_WIN32)
+            ::UnmapViewOfFile(data_);
+#else
+            ::munmap(const_cast<std::byte*>(data_), size_);
+#endif
+        }
+#if defined(_WIN32)
+        if (mapping_ != nullptr) { ::CloseHandle(mapping_); }
+        if (file_ != INVALID_HANDLE_VALUE) { ::CloseHandle(file_); }
+#else
         if (fd_ >= 0) { ::close(fd_); }
+#endif
     }
 
     MappedFile(const MappedFile&)            = delete;
@@ -257,6 +263,149 @@ public:
             std::memcpy(destination.data(), data_ + absolute_offset, bytes);
             return bytes;
         }
+#if defined(_WIN32)
+        return read_direct_windows(absolute_offset, destination);
+#else
+        return read_direct_posix(absolute_offset, destination);
+#endif
+    }
+
+private:
+#if defined(_WIN32)
+    void open_windows(const std::filesystem::path& path) {
+        // FILE_FLAG_OVERLAPPED makes every read explicitly positional, so concurrent uses of one
+        // Reader never share a file pointer. This handle is deliberately buffered:
+        // FILE_FLAG_NO_BUFFERING would impose 4096-byte sector alignment on the mapping and on
+        // every header read. The aligned read_direct() path keeps working through the cache;
+        // switching it to unbuffered I/O is a measured decision for later, not a correctness
+        // requirement.
+        // FILE_SHARE_WRITE as well as FILE_SHARE_READ: Windows rejects a read open unless the new
+        // share mode also permits whatever access existing handles hold (POSIX O_RDONLY coexists
+        // with a writer). A reader of a file being repaired or downloaded must not fail to open it.
+        // FILE_SHARE_DELETE keeps POSIX unlink semantics: a mapped artifact can still be removed
+        // while this Reader lives, which is what a caller replacing or cleaning up its own copy
+        // does. Without it, DeleteFile fails with ERROR_SHARING_VIOLATION.
+        file_ = ::CreateFileW(path.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                              OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        if (file_ == INVALID_HANDLE_VALUE) {
+            throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
+                                    "open " + display_path(path));
+        }
+
+        LARGE_INTEGER size{};
+        if (::GetFileSizeEx(file_, &size) == 0) {
+            const int error = static_cast<int>(::GetLastError());
+            ::CloseHandle(file_);
+            file_ = INVALID_HANDLE_VALUE;
+            throw std::system_error(error, std::system_category(), "stat " + display_path(path));
+        }
+        if (size.QuadPart < 0 ||
+            static_cast<std::uint64_t>(size.QuadPart) > std::numeric_limits<std::size_t>::max()) {
+            ::CloseHandle(file_);
+            file_ = INVALID_HANDLE_VALUE;
+            throw ArtifactError("artifact size does not fit the process address space");
+        }
+
+        size_ = static_cast<std::size_t>(size.QuadPart);
+        if (size_ != 0) {
+            // CreateFileMappingW's fourth argument is dwMaximumSizeHigh and its fifth is
+            // dwMaximumSizeLow. Both zero means "map the whole file"; they must not be swapped.
+            mapping_ = ::CreateFileMappingW(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+            if (mapping_ == nullptr) {
+                const int error = static_cast<int>(::GetLastError());
+                ::CloseHandle(file_);
+                file_ = INVALID_HANDLE_VALUE;
+                throw std::system_error(error, std::system_category(), "map " + display_path(path));
+            }
+            data_ = static_cast<const std::byte*>(
+                ::MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, size_));
+            if (data_ == nullptr) {
+                const int error = static_cast<int>(::GetLastError());
+                ::CloseHandle(mapping_);
+                ::CloseHandle(file_);
+                mapping_ = nullptr;
+                file_    = INVALID_HANDLE_VALUE;
+                throw std::system_error(error, std::system_category(), "view " + display_path(path));
+            }
+        }
+    }
+
+    std::size_t read_direct_windows(std::uint64_t absolute_offset,
+                                    std::span<std::byte> destination) const {
+        std::size_t done = 0;
+        while (done < destination.size()) {
+            // ReadFile takes a DWORD length, so a request above 1 GiB is split. Normal artifact
+            // reads are far smaller; the loop exists so the type never truncates.
+            const DWORD request =
+                static_cast<DWORD>(std::min<std::size_t>(destination.size() - done, 1ULL << 30));
+            const std::uint64_t offset = absolute_offset + done;
+            OVERLAPPED overlapped{};
+            overlapped.Offset     = static_cast<DWORD>(offset & 0xffffffffULL);
+            overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
+            DWORD bytes           = 0;
+            if (::ReadFile(file_, destination.data() + done, request, &bytes, &overlapped) == 0) {
+                const DWORD error = ::GetLastError();
+                // Reading exactly at end of file is EOF, not a failure; a shorter-than-requested
+                // transfer is also a legal short read and is reported to the caller as such.
+                if (error == ERROR_HANDLE_EOF) { return done; }
+                if (error != ERROR_IO_PENDING) {
+                    throw std::system_error(static_cast<int>(error), std::system_category(),
+                                            "direct artifact read at " + std::to_string(offset));
+                }
+                if (::GetOverlappedResult(file_, &overlapped, &bytes, TRUE) == 0) {
+                    const DWORD result = ::GetLastError();
+                    if (result == ERROR_HANDLE_EOF) { return done; }
+                    throw std::system_error(static_cast<int>(result), std::system_category(),
+                                            "direct artifact read at " + std::to_string(offset));
+                }
+            }
+            done += bytes;
+            if (bytes < request) { return done; }
+        }
+        return done;
+    }
+
+    HANDLE file_           = INVALID_HANDLE_VALUE;
+    HANDLE mapping_        = nullptr;
+#else
+    void open_posix(const std::filesystem::path& path) {
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+        if (fd < 0) {
+            throw std::system_error(errno, std::generic_category(), "open " + display_path(path));
+        }
+
+        struct stat status {};
+
+        if (::fstat(fd, &status) != 0) {
+            const int error = errno;
+            ::close(fd);
+            throw std::system_error(error, std::generic_category(), "fstat " + display_path(path));
+        }
+        if (status.st_size < 0 ||
+            static_cast<std::uintmax_t>(status.st_size) > std::numeric_limits<std::size_t>::max()) {
+            ::close(fd);
+            throw ArtifactError("artifact size does not fit the process address space");
+        }
+
+        const auto size = static_cast<std::size_t>(status.st_size);
+        void* mapping   = nullptr;
+        if (size != 0) {
+            mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (mapping == MAP_FAILED) {
+                const int error = errno;
+                ::close(fd);
+                throw std::system_error(error, std::generic_category(),
+                                        "mmap " + display_path(path));
+            }
+        }
+        fd_   = fd;
+        data_ = static_cast<const std::byte*>(mapping);
+        size_ = size;
+    }
+
+    std::size_t read_direct_posix(std::uint64_t absolute_offset,
+                                  std::span<std::byte> destination) const {
         if (absolute_offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
             destination.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
             throw ArtifactError("direct artifact read exceeds platform I/O limits");
@@ -273,9 +422,9 @@ public:
         return static_cast<std::size_t>(bytes);
     }
 
-private:
+    int fd_ = -1;
+#endif
     std::shared_ptr<const std::vector<std::byte>> image_;
-    int fd_                = -1;
     const std::byte* data_ = nullptr;
     std::size_t size_      = 0;
 };
@@ -1256,9 +1405,18 @@ std::shared_ptr<const std::vector<std::byte>> Reader::retain_in_memory(
     const std::function<void(std::uint64_t, std::uint64_t)>& progress) const {
     auto image = std::make_shared<std::vector<std::byte>>(file_bytes());
     constexpr std::size_t chunk = 8 * 1024 * 1024;
+    // The staging buffer feeds read_direct(), which requires the direct-I/O alignment on the
+    // destination address. MSVC spells the aligned allocation _aligned_malloc with a matching
+    // _aligned_free; freeing it with std::free would corrupt the heap.
     void* buffer = nullptr;
+#if defined(_WIN32)
+    buffer = ::_aligned_malloc(chunk, direct_io_alignment);
+    if (buffer == nullptr) { throw std::bad_alloc(); }
+    const std::unique_ptr<void, decltype(&::_aligned_free)> staging(buffer, &::_aligned_free);
+#else
     if (::posix_memalign(&buffer, direct_io_alignment, chunk) != 0) { throw std::bad_alloc(); }
     const std::unique_ptr<void, decltype(&std::free)> staging(buffer, &std::free);
+#endif
     if (progress) { progress(0, file_bytes()); }
     for (std::size_t offset = 0; offset < image->size();) {
         const auto remaining = std::min(chunk, image->size() - offset);

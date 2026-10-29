@@ -32,7 +32,7 @@ add_library(ninfer_core STATIC
   runtime/engine/request_memory.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads)
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
@@ -57,14 +57,23 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
     CUDA_SEPARABLE_COMPILATION OFF
     CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
   target_compile_options(ninfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-  target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+  target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cuda_driver)
 endif()
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_host_ops STATIC ops/host/vision.cpp)
+if(NOT BLAS_FOUND)
+  # No LP64 BLAS provider on this host. Keep the vision tower functional with the portable sgemm;
+  # it is single threaded and far slower than a tuned BLAS, which only affects CPU vision time.
+  message(STATUS "BLAS not found: using the portable sgemm for the CPU vision tower")
+  target_sources(ninfer_host_ops PRIVATE ops/host/sgemm_fallback.cpp)
+endif()
 ninfer_internal_includes(ninfer_host_ops)
-target_link_libraries(ninfer_host_ops PUBLIC ninfer_core PRIVATE BLAS::BLAS)
+target_link_libraries(ninfer_host_ops PUBLIC ninfer_core)
+if(BLAS_FOUND)
+  target_link_libraries(ninfer_host_ops PRIVATE BLAS::BLAS)
+endif()
 
 add_library(ninfer_ops STATIC
   ops/linear/ggml_k/ggml_k.cu
@@ -345,6 +354,16 @@ if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|86|89)$")
 endif()
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
+if(MSVC)
+  # This kernel instantiates CuTe layouts through helper templates that MSVC rejects under its
+  # conforming two-phase lookup (/permissive-, the C++20 default): "Layout: template argument for
+  # template parameter T must be a type". Relaxing conformance for this one translation unit
+  # restores the GCC-accepted interpretation; no other file needs it.
+  set_source_files_properties(
+    ops/launcher/gqa_attention_volta_splitd.cu
+    TARGET_DIRECTORY ninfer_ops
+    PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/permissive>")
+endif()
 target_link_libraries(ninfer_ops PUBLIC ninfer_core)
 target_link_libraries(ninfer_ops PRIVATE ninfer_host_ops)
 target_link_libraries(ninfer_ops PRIVATE ${CMAKE_DL_LIBS})
@@ -357,18 +376,39 @@ add_library(ninfer_text STATIC
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
+# utf8proc's header defaults to __declspec(dllimport) on Windows; this target compiles the
+# implementation into a static library, where a dllimport definition is rejected (C2491).
+target_compile_definitions(ninfer_text PUBLIC UTF8PROC_STATIC=1)
 
-add_library(ninfer_media_decode STATIC
-  media/decode/decode.cpp)
+if(NINFER_STUB_MEDIA)
+  add_library(ninfer_media_decode STATIC
+    media/decode/decode_stub_win.cpp)
+else()
+  add_library(ninfer_media_decode STATIC
+    media/decode/decode.cpp)
+endif()
 ninfer_internal_includes(ninfer_media_decode)
-target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+if(NOT NINFER_STUB_MEDIA)
+  target_link_libraries(ninfer_media_decode PRIVATE ${NINFER_FFMPEG_TARGET})
+endif()
 
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
-  add_library(ninfer_media_acquire STATIC
-    product/media_acquire/acquire.cpp)
+  if(NINFER_STUB_MEDIA)
+    add_library(ninfer_media_acquire STATIC
+      product/media_acquire/acquire_stub_win.cpp)
+  else()
+    add_library(ninfer_media_acquire STATIC
+      product/media_acquire/acquire.cpp)
+  endif()
   ninfer_internal_includes(ninfer_media_acquire)
-  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  if(NOT NINFER_STUB_MEDIA)
+    target_link_libraries(ninfer_media_acquire PRIVATE ${NINFER_CURL_TARGET})
+    if(WIN32)
+      # getaddrinfo and inet_ntop live in winsock; the POSIX builds get them from libc.
+      target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
+    endif()
+  endif()
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)
@@ -427,5 +467,5 @@ if(NINFER_BUILD_SERVE)
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire CUDA::cudart)
+    PRIVATE ninfer_media_acquire ${NINFER_CUDART_TARGET} ${CMAKE_DL_LIBS})
 endif()

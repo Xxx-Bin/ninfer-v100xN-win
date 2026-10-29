@@ -14,6 +14,10 @@ endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
+# FindFFMPEG.cmake resolves the media decoder's headers and libraries on platforms without
+# pkg-config (Windows, vcpkg prefix trees).
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
     message(FATAL_ERROR "Volta sm_70 requires CUDA 12.8; CUDA 13 removed Volta compilation")
@@ -42,6 +46,11 @@ endif()
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+# Keeps every product target and its link graph while removing the two native media dependencies
+# (FFmpeg for image/video decode, libcurl for URL acquisition). The stub translation units satisfy
+# the same symbols and throw at runtime, so a platform port can be brought up without a media
+# toolchain. Media features are unavailable in such a build by construction.
+option(NINFER_STUB_MEDIA "Build without FFmpeg/libcurl; media features fail at runtime" OFF)
 # CUDA device selection is a runtime concern. When set, CTest injects this value as
 # CUDA_VISIBLE_DEVICES so tests using logical devices 0/1 can run on a selected pair on
 # multi-GPU hosts without changing the product's device numbering or compile target.
@@ -59,11 +68,17 @@ if(MSVC)
   # stays at 199711L even under /std:c++20, and CUDA's <vector_types.h> then hides the constexpr
   # dim3 constructors behind its own __cplusplus >= 201103L test, which fails to compile every
   # translation unit that builds a dim3 in a constant expression.
+  # Every source in this tree is UTF-8 (comment text is Chinese in a few kernels). MSVC decodes
+  # sources as the ANSI code page by default, which both spams C4819 and can turn a multi-byte
+  # comment into invalid tokens -- gqa_attention_volta_splitd.cu fails to parse that way ("expected
+  # an expression" on a comment line). Pin source and execution charset to UTF-8, matching Linux.
   add_compile_options(
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:__cplusplus>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>)
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>
+    $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
   # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
   # the project-wide /MD runtime. Keep one CRT in the final process.
   add_link_options(/NODEFAULTLIB:LIBCMT)
@@ -104,31 +119,36 @@ if(WIN32)
 else()
   set(NINFER_CUDART_TARGET CUDA::cudart)
 endif()
-if(WIN32 OR DEFINED VCPKG_TARGET_TRIPLET)
-  find_package(FFMPEG REQUIRED)
-  add_library(ninfer_ffmpeg_dependencies INTERFACE)
-  target_include_directories(ninfer_ffmpeg_dependencies INTERFACE ${FFMPEG_INCLUDE_DIRS})
-  target_link_directories(ninfer_ffmpeg_dependencies INTERFACE ${FFMPEG_LIBRARY_DIRS})
-  target_link_libraries(ninfer_ffmpeg_dependencies INTERFACE ${FFMPEG_LIBRARIES})
-  set(NINFER_FFMPEG_TARGET ninfer_ffmpeg_dependencies)
-  if(NINFER_BUILD_MEDIA_ACQUIRE)
-    find_package(CURL 7.85 REQUIRED)
-    set(NINFER_CURL_TARGET CURL::libcurl)
-  endif()
-else()
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-    libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
-  set(NINFER_FFMPEG_TARGET PkgConfig::FFMPEG)
-  if(NINFER_BUILD_MEDIA_ACQUIRE)
-    pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
-    set(NINFER_CURL_TARGET PkgConfig::LIBCURL)
+if(NOT NINFER_STUB_MEDIA)
+  if(WIN32 OR DEFINED VCPKG_TARGET_TRIPLET)
+    find_package(FFMPEG REQUIRED)
+    add_library(ninfer_ffmpeg_dependencies INTERFACE)
+    target_include_directories(ninfer_ffmpeg_dependencies INTERFACE ${FFMPEG_INCLUDE_DIRS})
+    target_link_directories(ninfer_ffmpeg_dependencies INTERFACE ${FFMPEG_LIBRARY_DIRS})
+    target_link_libraries(ninfer_ffmpeg_dependencies INTERFACE ${FFMPEG_LIBRARIES})
+    set(NINFER_FFMPEG_TARGET ninfer_ffmpeg_dependencies)
+    if(NINFER_BUILD_MEDIA_ACQUIRE)
+      find_package(CURL 7.85 REQUIRED)
+      set(NINFER_CURL_TARGET CURL::libcurl)
+    endif()
+  else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+      libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+    set(NINFER_FFMPEG_TARGET PkgConfig::FFMPEG)
+    if(NINFER_BUILD_MEDIA_ACQUIRE)
+      pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+      set(NINFER_CURL_TARGET PkgConfig::LIBCURL)
+    endif()
   endif()
 endif()
 find_package(Threads REQUIRED)
+# BLAS backs one thing: the CPU vision tower's sgemm (src/ops/host/vision.cpp). Linux resolves it
+# from the system provider; a Windows host usually has none installed, so a miss is not fatal
+# there -- src/CMakeLists.txt then compiles the portable sgemm instead.
 set(BLA_SIZEOF_INTEGER 4)
 set(BLA_PREFER_PKGCONFIG ON)
-find_package(BLAS REQUIRED)
+find_package(BLAS QUIET)
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)

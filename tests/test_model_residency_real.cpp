@@ -4,7 +4,13 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#if defined(_WIN32)
+#include <process.h>
+// MSVC spells the pid source _getpid and has no POSIX getpid; the call sites stay unchanged.
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 using namespace ninfer;
 using namespace ninfer::serve;
@@ -35,7 +41,8 @@ int main() {
                   ("ninfer-residency-" + std::to_string(::getpid()) + ".ninfer")};
         std::filesystem::create_symlink(artifact, link.path);
         ServeOptions options;
-        options.artifact_path = link.path;
+        // std::filesystem::path converts to std::string implicitly on GCC but not on MSVC.
+        options.artifact_path = link.path.string();
         options.tp = 2;
         options.devices = {0, 1};
         options.max_context = 4096;

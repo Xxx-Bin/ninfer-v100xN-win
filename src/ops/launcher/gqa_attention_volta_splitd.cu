@@ -7,6 +7,13 @@
 #include <cutlass/numeric_types.h>
 #include <cuda_bf16.h>
 #include <cmath>
+
+// glibc exposes log2(e) as M_LOG2E from <cmath>; the MSVC CRT only declares it under
+// _USE_MATH_DEFINES. Same value either way, so the softmax scale below is identical on both.
+#if !defined(M_LOG2E)
+#define M_LOG2E 1.4426950408889634074
+#endif
+
 #include "ops/launcher/gqa_attention_volta_splitd.h"
 #include "ops/launcher/kernel_attr_once.h"
 

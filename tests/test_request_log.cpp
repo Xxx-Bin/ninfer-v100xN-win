@@ -12,7 +12,13 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#include <process.h>
+// MSVC spells the pid source _getpid and has no POSIX getpid; the call sites stay unchanged.
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 

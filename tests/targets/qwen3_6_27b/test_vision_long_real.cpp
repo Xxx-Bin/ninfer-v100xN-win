@@ -5,7 +5,9 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#if !defined(_WIN32)
 #include <sys/resource.h>
+#endif
 
 namespace {
 ninfer::PromptInput input_for(std::size_t repetitions, bool image) {

@@ -10,6 +10,10 @@
 #include <cstddef>
 #include <fstream>
 #include <mutex>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -289,19 +293,35 @@ ninfer::RuntimeStats add_execution_stats(ninfer::RuntimeStats current,
     throw ApiException(std::move(error));
 }
 
+// Refuse a load that cannot fit in currently available host RAM plus 1 GiB of headroom. The two
+// platforms measure this differently: Linux reads MemAvailable from /proc/meminfo (available, not
+// free: reclaimable page cache counts), Windows asks GlobalMemoryStatusEx for ullAvailPhys. Both
+// answer the same question, so the admission threshold is identical.
 void check_host_memory(std::uint64_t required) {
+    constexpr std::uint64_t reserve = 1024ULL * 1024 * 1024;
+#if defined(_WIN32)
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    // A failed query is not a reason to reject the load: report nothing and let the allocator
+    // decide, exactly as the POSIX path does when MemAvailable is absent.
+    if (::GlobalMemoryStatusEx(&status) == 0) { return; }
+    if (static_cast<std::uint64_t>(status.ullAvailPhys) < required + reserve) {
+        residency_error(507, "insufficient_host_memory",
+                        "not enough available host RAM for the model plus 1 GiB headroom");
+    }
+#else
     std::ifstream input("/proc/meminfo");
     std::string key, unit;
     std::uint64_t kib = 0;
     while (input >> key >> kib >> unit) {
         if (key != "MemAvailable:") { continue; }
-        constexpr std::uint64_t reserve = 1024ULL * 1024 * 1024;
         if (kib * 1024 < required + reserve) {
             residency_error(507, "insufficient_host_memory",
                             "not enough available host RAM for the model plus 1 GiB headroom");
         }
         break;
     }
+#endif
 }
 } // namespace
 

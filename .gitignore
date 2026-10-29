@@ -52,3 +52,7 @@ profiles/
 
 # Generated release packages and Docker exports
 dist/
+
+# Windows portable toolchain and pip tooling (never tracked; see docs/windows-build.md)
+_toolchain/
+.tools/

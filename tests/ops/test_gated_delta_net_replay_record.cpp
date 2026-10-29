@@ -121,7 +121,7 @@ int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width
     Tensor value_record_tensor(value_record.p, DType::BF16, {kStateDim, value_heads, width, batch});
     Tensor gate_record_tensor(gate_record.p, DType::FP32, {2, value_heads, width, batch});
 
-    constexpr float kScale = 1.0F / std::sqrt(128.0F);
+    const float kScale = 1.0F / std::sqrt(128.0F);
     const auto norm_weight_bits = make_bf16(128, seed + 10);
     const auto norm_z_bits = make_bf16(value_elements, seed + 11);
     DeviceBuffer norm_weight = to_device(norm_weight_bits);
@@ -367,7 +367,7 @@ std::vector<double> run_record(std::int32_t qk_heads, std::int32_t value_heads,
     Tensor value_tensor(value_record.p, DType::BF16, {kStateDim, value_heads, width, 1});
     Tensor gate_tensor(gate_record.p, DType::FP32, {2, value_heads, width, 1});
 
-    constexpr float kScale = 1.0F / std::sqrt(128.0F);
+    const float kScale = 1.0F / std::sqrt(128.0F);
     if (qk_heads == 4 && value_heads == 12 && width <= 8) {
         auto weight = to_device(make_bf16(128, 2211U));
         auto z = to_device(make_bf16(value_elements, 2212U));

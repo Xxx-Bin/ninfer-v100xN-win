@@ -9,10 +9,43 @@
 #include <string>
 #include <utility>
 #include <type_traits>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <sys/mman.h>
+#endif
 
 namespace ninfer {
 namespace {
+
+// The host KV archive is one large anonymous mapping: lazily backed, zero filled, released as a
+// unit. Windows spells it VirtualAlloc(VirtualFree); POSIX spells it mmap(MAP_ANONYMOUS)(munmap).
+// Both cost only the reservation up front, which matters because the archive scales with the
+// configured context and would otherwise be committed physically at allocation time.
+void* const kArchiveUnmapped =
+#if defined(_WIN32)
+    nullptr;
+#else
+    MAP_FAILED;
+#endif
+
+void* map_anonymous_archive(std::size_t bytes) noexcept {
+#if defined(_WIN32)
+    return ::VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+    return ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
+}
+
+void unmap_anonymous_archive(void* archive, std::size_t bytes) noexcept {
+#if defined(_WIN32)
+    (void)bytes;
+    (void)::VirtualFree(archive, 0, MEM_RELEASE);
+#else
+    (void)::munmap(archive, bytes);
+#endif
+}
 
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
     if (value == 0 ||
@@ -303,7 +336,7 @@ void PagedKVPool::release_row(std::int32_t row) noexcept {
 }
 
 struct PagedKVAllocation::RamState {
-    void* archive = MAP_FAILED;
+    void* archive = kArchiveUnmapped;
     std::size_t bytes = 0;
     std::vector<std::size_t> plane_offsets;
     std::vector<bool> archived;
@@ -324,11 +357,12 @@ struct PagedKVAllocation::RamState {
             plane_offsets.push_back(offset);
             offset += pool.plane(p).nb[3] * pool.logical_page_capacity();
         }
-        archive = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (archive == MAP_FAILED) { throw std::bad_alloc(); }
+        archive = map_anonymous_archive(bytes);
+        if (archive == kArchiveUnmapped) { throw std::bad_alloc(); }
     }
-    ~RamState() { if (archive != MAP_FAILED) { munmap(archive, bytes); } }
+    ~RamState() {
+        if (archive != kArchiveUnmapped) { unmap_anonymous_archive(archive, bytes); }
+    }
 };
 
 PagedKVAllocation::PagedKVAllocation() noexcept = default;
