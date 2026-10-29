@@ -7,9 +7,14 @@ including the ones that are environment-specific.
 ## 1. Entry points
 
 ```bat
-scripts\windows\configure-novcvars.cmd          :: write build-win
+scripts\windows\configure-novcvars.cmd          :: write build-win (media stubbed)
 scripts\windows\build-novcvars.cmd              :: full incremental build, -j2
 scripts\windows\build-novcvars.cmd -j2 ninfer_ops   :: one target
+
+scripts\windows\fetch_cuda_toolkit.py           :: portable CUDA 12.8 into _toolchain
+scripts\windows\fetch-media-deps.cmd            :: FFmpeg 8.1 + libcurl into _toolchain\media
+scripts\windows\configure-media.cmd             :: write build-win-media (media enabled)
+scripts\windows\build.cmd ninfer ninfer-serve   :: build that tree
 ```
 
 `configure.cmd` / `build.cmd` are the vcvars-based variants and only work on hosts where
@@ -150,9 +155,66 @@ Notes on the build itself:
 
 Known gaps:
 
-- Media is stubbed in this tree; a media-enabled tree needs FFmpeg 8.1 and libcurl dev libraries
-  plus `-DNINFER_STUB_MEDIA=OFF`.
+- Media is stubbed in the trees this host built (`NINFER_STUB_MEDIA=ON`). The media path is wired
+  for Windows — `decode.cpp` and `acquire.cpp` compile under MSVC against FFmpeg 8.1 and libcurl
+  8.11.1, `acquire.cpp` uses Winsock and `ws2_32` — and CI builds that configuration, but no media
+  build has been run on the cards yet.
 - TP4 has no Windows precedent (the sibling port validated TP2 only).
 - The CPU vision tower runs on the portable sgemm, so vision latency will not match Linux numbers.
 - `tests/test_model_residency_real.cpp` uses `create_symlink`, which needs Developer Mode or an
   elevated shell on Windows.
+
+## 7. Continuous integration and release
+
+`.github/workflows/build-windows.yml` is the repository's only build pipeline. It calls the same
+`scripts\windows\*.cmd` a developer calls, so a CI tree and a local tree come from identical CMake
+arguments: `sm_70`, `NINFER_STUB_MEDIA=OFF`, portable CUDA 12.8, FFmpeg 8.1 and libcurl 8.11.1.
+
+One entry point: a manual dispatch with the inputs `tag` (base tag) and `prefix`. `prefix: test-`
+publishes a **prerelease**; an empty prefix publishes a real release. There is no tag-push trigger.
+
+Four constraints shaped the job:
+
+- **`windows-2022`, not `windows-latest`.** The newest runner image ships Visual Studio 2026 (MSVC
+  14.51). CUDA 12.8's front end rejects it (`crt/host_config.h` allows `_MSC_VER < 1950`) and then
+  dies in `cudafe++` with `0xC0000005`. `windows-2022` stays on MSVC 14.4x, inside the accepted range.
+- **`NINFER_BUILD_JOBS=4`.** A hosted runner has 4 cores and 16 GB; each `nvcc` can hold several GB
+  while expanding CUTLASS templates.
+- **The release tag is created through the Releases API** (`softprops/action-gh-release`), not by
+  `git push`: `GITHUB_TOKEN` acts as a GitHub App and may not create a ref whose commit touches
+  `.github/workflows/*` without the `workflows` scope.
+- **Dispatch-only, no tag-push trigger.** A promotion creates the release tag through the API, which
+  fires the same push event; a `push: tags` trigger therefore started a second build that failed in
+  `Publish release` because the release already existed.
+
+The release ships **one zip archive** (`ninfer-<tag>-windows-x64-cuda12.8-sm70.zip`) plus a
+sha256sum-style `.sha256` sidecar. The archive holds both executables and every FFmpeg and libcurl
+DLL, staged next to the binaries by `apps/CMakeLists.txt`. A separate step extracts the archive
+again and compares every file with the staged build output, so a truncated archive fails the run
+instead of the download.
+
+The runner has no GPU, so CI proves the tree configures, compiles, links and packages — it does
+**not** prove throughput or output. Numerical checks, the `ctest` suite and the media fixtures stay
+local, on the run below.
+
+### Release flow
+
+1. Push the code to the fork (`master`).
+2. `Run workflow` with `tag` set to the next unused `vX.Y.Z-win.N` and `prefix` set to `test-`. The
+   run publishes `test-<tag>` as a **prerelease**, so it never becomes Latest.
+3. Download the archive on the V100 host, unzip it into an empty directory, and run
+   `scripts\windows\smoke.cmd` plus the media fixtures. Record measured numbers.
+4. Pass: promote in place with
+   [`scripts\windows\promote-release.ps1`](../scripts/windows/promote-release.ps1) — it renames the
+   tag, clears `prerelease`, drops the `[TEST]` title prefix, replaces the TEST BUILD banner with
+   `-AcceptanceNote`, renames both assets, rewrites the `.sha256` sidecar and deletes the leftover
+   `test-` tag. The archive keeps its bytes and its digest. Fail: delete the release and its tag,
+   fix the code, and build the next number — `win.N` only moves forward.
+
+```powershell
+$env:GH_TOKEN = '<token with repo scope>'
+scripts\windows\promote-release.ps1 -Tag v0.2.0-win.1 `
+  -AcceptanceNote 'Accepted on 2x V100: media smoke, TP2 text, archive extract.' -DryRun
+```
+
+Dry run first: it prints the tag, title, asset renames and body change and writes nothing.

@@ -1,6 +1,6 @@
 # NInfer V100X2
 
-[中文](README.zh-CN.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Docker](docs/docker.md) · [Detailed measurements](docs/performance.md) · [HTTP API](docs/serving.md)
+[中文](README.zh-CN.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Docker](docs/docker.md) · [Windows build](docs/windows-build.md) · [Detailed measurements](docs/performance.md) · [HTTP API](docs/serving.md)
 
 **Compared with the decode implementation before v0.1.0, committed throughput on the same 85K-token
 code task increased from 143.46 to 198.10 tok/s — about 38.1% faster.** Both measurements

@@ -1,6 +1,6 @@
 # NInfer V100X2
 
-[English](README.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Docker](docs/docker.md) · [详细测评](docs/performance.md) · [HTTP API](docs/serving.md)
+[English](README.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Docker](docs/docker.md) · [Windows 构建](docs/windows-build.md) · [详细测评](docs/performance.md) · [HTTP API](docs/serving.md)
 
 **相比 v0.1.0 前的上代解码实现，同一 85K-token 代码任务的已提交 decode 吞吐从 143.46 提升至 198.10 tok/s，约提升 38.1%。**
 两次测评均使用双 V100 16 GB、180K 容量、TP2/MTP4、INT8 KV、CUDA Graphs 和 greedy 采样。

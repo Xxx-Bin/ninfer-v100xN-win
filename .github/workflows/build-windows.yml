@@ -1,0 +1,194 @@
+name: build-windows
+
+# The only build pipeline for this repository: a native Windows x64 tree for 2x Tesla V100
+# (sm_70) with the media path enabled (NINFER_STUB_MEDIA=OFF: FFmpeg decode + libcurl URL
+# acquisition). It calls the same scripts as a local build (scripts/windows/*.cmd), so a CI tree
+# and a developer tree are produced by identical CMake arguments.
+# Dispatch-only on purpose: creating a release tag through the Releases API - which is what a
+# promotion does - fires the same push event a `git push` of that tag would, so a `push: tags ["v*"]`
+# trigger started a second build on every promotion, and that build then failed in `Publish release`
+# because the release already existed.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Base release tag, e.g. v0.2.0-win.1"
+        required: true
+        default: "v0.2.0-win.1"
+      prefix:
+        description: "Prefix for a test release (empty = real release)"
+        required: false
+        default: "test-"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    # windows-2022, not windows-latest: the newest image ships Visual Studio 2026 (MSVC 14.51),
+    # which CUDA 12.8's front end rejects (its crt/host_config.h allows _MSC_VER < 1950) and then
+    # crashes in cudafe++ with 0xC0000005. windows-2022 keeps MSVC 14.4x, inside 12.8's accepted
+    # range, and matches the VS2022 toolchain used for local builds.
+    runs-on: windows-2022
+    # The first tree compiles ~430 translation units on 4 cores; the cap matches GitHub's
+    # hosted-runner job limit so a slow first build fails loudly instead of being killed at the
+    # default 6 h boundary without a clear reason.
+    timeout-minutes: 360
+    env:
+      NINFER_BUILD_DIR: ${{ github.workspace }}\build-win-media
+      # Each nvcc process can hold several GB while expanding CUTLASS templates. Hosted runners
+      # have 4 cores / 16 GB, so cap the job count.
+      NINFER_BUILD_JOBS: "4"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        shell: pwsh
+        run: |
+          cmake --version
+          ninja --version
+          python --version
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            "VS $(& $vswhere -latest -property installationVersion) at $(& $vswhere -latest -property installationPath)"
+          }
+
+      - name: Fetch portable CUDA 12.8 toolkit
+        # NVIDIA's redistributable archives: nvcc + cudart + CCCL + NVTX into _toolchain\cuda-12.8.
+        # CUDA 13 removed Volta offline compilation, so 12.8 is the last usable toolkit.
+        run: python scripts\windows\fetch_cuda_toolkit.py
+
+      - name: Clone CUTLASS v4.4.2
+        # FetchContent's git submodule update goes through MSYS sh on Windows; a pre-cloned checkout
+        # keeps configure off that path (configure*.cmd pick it up via FETCHCONTENT_SOURCE_DIR_CUTLASS).
+        run: git clone --depth 1 --branch v4.4.2 https://github.com/nvidia/cutlass.git _toolchain\cutlass
+
+      - name: Fetch media dependencies
+        # FFmpeg 8.1 development tree (headers + import libraries) and a libcurl built from source
+        # with Schannel. Only a development tree links; the plain ffmpeg.exe download does not.
+        run: scripts\windows\fetch-media-deps.cmd
+
+      - name: Configure (sm_70, media enabled)
+        run: scripts\windows\configure-media.cmd
+
+      - name: Build ninfer and ninfer-serve
+        run: scripts\windows\build.cmd ninfer ninfer-serve
+
+      - name: Stage release artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build-win-media\apps\ninfer.exe dist\
+          Copy-Item build-win-media\apps\ninfer-serve.exe dist\
+          # The post-build step in apps/CMakeLists.txt stages FFmpeg and libcurl DLLs next to the
+          # executables; they have to travel with the release or the binaries fail to start.
+          Copy-Item build-win-media\apps\*.dll dist\
+          if (-not (Get-ChildItem dist -Filter *.dll)) {
+            throw "no media runtime DLLs were staged next to the executables"
+          }
+          Get-ChildItem dist | Select-Object Name, Length
+
+      - name: Resolve release identity
+        id: release
+        shell: pwsh
+        env:
+          IN_TAG: ${{ inputs.tag }}
+          IN_PREFIX: ${{ inputs.prefix }}
+        run: |
+          $baseTag = $env:IN_TAG
+          $prefix = $env:IN_PREFIX
+          if (-not $baseTag) { throw "no base tag resolved" }
+          $releaseTag = "$prefix$baseTag"
+          $titlePrefix = if ($prefix) { "[TEST] " } else { "" }
+          $title = "${titlePrefix}NInfer V100X2 $baseTag (Windows x64, 2x V100, CUDA 12.8, sm_70, media enabled)"
+          $isTest = if ($prefix) { "true" } else { "false" }
+          "RELEASE_TAG=$releaseTag" >> $env:GITHUB_ENV
+          "RELEASE_TITLE=$title" >> $env:GITHUB_ENV
+          "IS_TEST=$isTest" >> $env:GITHUB_ENV
+          Write-Output "tag=$releaseTag title=$title test=$isTest"
+
+      - name: Package release archive
+        shell: pwsh
+        run: |
+          $zipName = "ninfer-$env:RELEASE_TAG-windows-x64-cuda12.8-sm70.zip"
+          New-Item -ItemType Directory -Force package | Out-Null
+          # bsdtar ships with Windows and writes a real zip when the name ends in .zip. One
+          # archive holds both executables and every FFmpeg/libcurl DLL, so a release can never
+          # be downloaded without the runtime files the media build loads next to the binary.
+          $entries = Get-ChildItem dist -File | Select-Object -ExpandProperty Name
+          & tar.exe -a -cf "package\$zipName" -C dist @entries
+          if ($LASTEXITCODE -ne 0) { throw "packaging $zipName failed" }
+          $zip = Get-Item "package\$zipName"
+          "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+          Get-Item $zip | Select-Object Name, Length
+
+      - name: Verify the archive round-trips
+        shell: pwsh
+        run: |
+          # Extract the archive that is about to be published and compare every file with the
+          # staged build output, so a truncated or mis-built zip fails here instead of at the
+          # user's machine. The extraction root stays outside package/ so it never becomes a
+          # release asset.
+          $check = "archive-check"
+          New-Item -ItemType Directory -Force $check | Out-Null
+          & tar.exe -xf "package\$env:ZIP_NAME" -C $check
+          if ($LASTEXITCODE -ne 0) { throw "archive extraction failed" }
+          $staged = Get-ChildItem dist -File
+          foreach ($file in $staged) {
+            $copy = Join-Path $check $file.Name
+            if (-not (Test-Path $copy)) { throw "$($file.Name) is missing from the archive" }
+            $a = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+            $b = (Get-FileHash $copy -Algorithm SHA256).Hash
+            if ($a -ne $b) { throw "$($file.Name) does not round-trip through the archive" }
+          }
+          if ((Get-ChildItem $check -File).Count -ne $staged.Count) {
+            throw "archive file count differs from the staged build output"
+          }
+          Write-Output "archive round-trip verified: $($staged.Count) files"
+
+      - name: Compute archive hashes and release notes
+        shell: pwsh
+        run: |
+          $zip = Get-Item "package\$env:ZIP_NAME"
+          $sha = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower()
+          "ZIP_SHA256=$sha" >> $env:GITHUB_ENV
+          # sha256sum-compatible sidecar ("<hex>  <file>"), so `sha256sum -c` works after a
+          # download.
+          "$sha  $($zip.Name)" | Set-Content "package\$env:ZIP_NAME.sha256" -NoNewline -Encoding ascii
+          # The body is written to a file rather than passed as a multiline `body: |` input: that
+          # value went through YAML and env-file interpolation, and the Contents table arrived as
+          # one table per row. release-notes.md stays outside package/ so it is not an asset.
+          # Scope-limited so the repository script runs whatever the image's policy is.
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $notesArgs = @{
+            ZipName       = $zip.Name
+            Sha256        = $sha
+            DistDirectory = 'dist'
+            OutFile       = 'release-notes.md'
+          }
+          if ($env:IS_TEST -eq 'true') { $notesArgs.Test = $true }
+          scripts\windows\release-notes.ps1 @notesArgs
+          Write-Output "archive=$($zip.Name) sha256=$sha"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-cuda12.8-sm70-media
+          path: package/*
+
+      # The tag is created by the release action through the Releases API. Pushing it with
+      # `git push` is rejected here: GITHUB_TOKEN acts as a GitHub App and is not allowed to
+      # create a ref whose commit touches `.github/workflows/*` without the `workflows` scope,
+      # which the `permissions:` block cannot grant.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ env.RELEASE_TITLE }}
+          prerelease: ${{ env.IS_TEST == 'true' }}
+          body_path: release-notes.md
+          files: package/*
