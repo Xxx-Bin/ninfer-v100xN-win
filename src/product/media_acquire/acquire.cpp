@@ -2,9 +2,17 @@
 
 #include <curl/curl.h>
 
+#if defined(_WIN32)
+// The address-family check below is the same Winsock and BSD sockets API, so only the headers and
+// the library start-up differ: MSVC has no arpa/inet.h, netdb.h or sys/socket.h, and getaddrinfo
+// refuses to run until WSAStartup has initialised Winsock.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -143,6 +151,18 @@ UrlParts parse_url(std::string_view value) {
 }
 
 std::string resolve_public(const UrlParts& url, bool allow_private) {
+#if defined(_WIN32)
+    // Winsock has to be initialised once per process before the first getaddrinfo. The static
+    // object does it on first use; no WSACleanup, because the process keeps resolving.
+    struct WinsockInit {
+        WinsockInit() {
+            WSADATA data{};
+            WSAStartup(MAKEWORD(2, 2), &data);
+        }
+    };
+    static const WinsockInit winsock;
+    (void)winsock;
+#endif
     addrinfo hints{};
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -287,7 +307,10 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
     if (!policy.media_root.empty()) {
         const std::filesystem::path root = std::filesystem::weakly_canonical(policy.media_root, ec);
         const auto relative              = std::filesystem::relative(path, root, ec);
-        if (ec || relative.empty() || relative.native().starts_with("..")) {
+        // Compared per component rather than through native(), which is wchar_t on Windows and
+        // cannot be matched against a narrow ".." literal.
+        const std::filesystem::path parent = "..";
+        if (ec || relative.empty() || *relative.begin() == parent) {
             throw std::invalid_argument("media path is outside configured media root");
         }
     }
